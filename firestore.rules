@@ -1,0 +1,343 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Read user role safely (admin/client/staff profile)
+    function getUserRole() {
+      let path = /databases/$(database)/documents/users/$(request.auth.uid);
+      return exists(path) ? get(path).data.get('role', null) : null;
+    }
+
+    // Read user companyId safely
+    function getUserCompanyId() {
+      let path = /databases/$(database)/documents/users/$(request.auth.uid);
+      return exists(path) ? get(path).data.get('companyId', null) : null;
+    }
+
+    // Read talent role safely
+    function getTalentRole() {
+      let path = /databases/$(database)/documents/talents/$(request.auth.uid);
+      return exists(path) ? get(path).data.get('role', null) : null;
+    }
+
+    // Read talent companyId safely
+    function getTalentCompanyId() {
+      let path = /databases/$(database)/documents/talents/$(request.auth.uid);
+      return exists(path) ? get(path).data.get('companyId', null) : null;
+    }
+
+    // Case-insensitive companyId comparison using .lower()
+    function sameCompany(a, b) {
+      return a != null && b != null && a.lower() == b.lower();
+    }
+
+    function isPlatformAdmin() {
+      return isAuthenticated() && getUserRole() == 'platform_admin';
+    }
+
+    function isAdminOrStaff() {
+      let role = getUserRole();
+      return isAuthenticated() && (role == 'admin' || role == 'staff' || role == 'company_admin');
+    }
+
+    function myCompanyId() {
+      return getUserCompanyId();
+    }
+
+    // Effective companyId: check users first, fall back to talents collection
+    function myEffectiveCompanyId() {
+      let cid = getUserCompanyId();
+      return cid != null ? cid : getTalentCompanyId();
+    }
+
+    // Effective role: check users first, fall back to talents collection
+    function myEffectiveRole() {
+      let r = getUserRole();
+      return r != null ? r : getTalentRole();
+    }
+
+    function belongsToCompany(companyId) {
+      return isAuthenticated() &&
+             (sameCompany(myEffectiveCompanyId(), companyId) || isPlatformAdmin());
+    }
+
+    // Check if caller is a talent (in either collection)
+    function isTalent() {
+      return isAuthenticated() && myEffectiveRole() == 'talent';
+    }
+
+    // Check if talent belongs to the same company as a booking
+    function talentBelongsToBookingCompany() {
+      return isTalent() && sameCompany(myEffectiveCompanyId(), resource.data.companyId);
+    }
+
+    // ── Users Collection ──────────────────────────────────────────────────────
+    match /users/{userId} {
+      // Allow public read of talent profiles for SEO and unauthenticated profile views
+      allow read: if resource.data.role == 'talent';
+
+      allow read, write: if isAuthenticated() && request.auth.uid == userId;
+      allow read, write, delete: if isPlatformAdmin();
+
+      allow read: if isAdminOrStaff() || isPlatformAdmin() || (
+                    isAuthenticated() &&
+                    (getUserRole() in ['admin', 'staff', 'client', 'company_admin']) &&
+                    (resource.data.companyId == myCompanyId() || sameCompany(myCompanyId(), resource.data.companyId) || resource.data.role == 'talent')
+                  );
+
+      // Talent can read users to send notifications to admins/clients
+      allow read: if isTalent() &&
+                  (resource.data.companyId == myEffectiveCompanyId() || sameCompany(myEffectiveCompanyId(), resource.data.companyId));
+
+      allow create: if isAdminOrStaff() &&
+                    sameCompany(request.resource.data.companyId, myCompanyId());
+
+      allow update, delete: if isAuthenticated() &&
+                    (getUserRole() == 'admin' || getUserRole() == 'company_admin') &&
+                    sameCompany(myCompanyId(), resource.data.companyId);
+
+      allow update: if isAuthenticated() && belongsToCompany(resource.data.companyId);
+    }
+
+    // ── Companies Collection ──────────────────────────────────────────────────
+    match /companies/{companyId} {
+      allow read: if true;
+      allow create: if isPlatformAdmin() || (isAuthenticated() && request.resource.data.adminId == request.auth.uid);
+      allow delete: if isPlatformAdmin();
+      allow update: if isPlatformAdmin() ||
+                    (belongsToCompany(companyId) && isAdminOrStaff()) ||
+                    (resource.data.activationToken != null &&
+                     request.resource.data.get('verifyToken', null) == resource.data.activationToken &&
+                     request.resource.data.emailVerified == true &&
+                     request.resource.data.trialActivated == true &&
+                     request.resource.data.activationToken == null);
+
+      match /talentTypes/{docId} {
+        allow read: if isAuthenticated();
+        allow write: if isPlatformAdmin() || (isAdminOrStaff() && belongsToCompany(companyId));
+      }
+
+      match /genders/{docId} {
+        allow read: if isAuthenticated();
+        allow write: if isPlatformAdmin() || (isAdminOrStaff() && belongsToCompany(companyId));
+      }
+
+      match /locations/{stateId} {
+        allow read: if isAuthenticated();
+        allow write: if isPlatformAdmin() || (isAdminOrStaff() && belongsToCompany(companyId));
+
+        match /cities/{cityId} {
+          allow read: if isAuthenticated();
+          allow write: if isPlatformAdmin() || (isAdminOrStaff() && belongsToCompany(companyId));
+        }
+      }
+
+      match /settings/{settingId} {
+        allow read: if isAuthenticated();
+        allow write: if isPlatformAdmin() || (isAdminOrStaff() && belongsToCompany(companyId));
+      }
+
+      match /subscriptionPayments/{paymentId} {
+        allow read: if belongsToCompany(companyId);
+        allow write: if isPlatformAdmin() || (belongsToCompany(companyId) && isAdminOrStaff());
+      }
+    }
+
+    // ── Talents Collection ────────────────────────────────────────────────────
+    match /talents/{talentId} {
+      allow read: if true;
+
+      allow create, update: if isAuthenticated() && (request.auth.uid == talentId || belongsToCompany(resource.data.companyId));
+
+      allow create: if isAdminOrStaff() &&
+                    sameCompany(myCompanyId(), request.resource.data.companyId);
+      allow update: if isAdminOrStaff() &&
+                    sameCompany(myCompanyId(), resource.data.companyId);
+      allow delete: if isAuthenticated() && (getUserRole() == 'admin' || getUserRole() == 'company_admin') &&
+                    sameCompany(myCompanyId(), resource.data.companyId);
+
+      allow read, write, delete: if isPlatformAdmin();
+    }
+
+    // ── Bookings Collection ───────────────────────────────────────────────────
+    match /bookings/{bookingId} {
+      allow read, write, delete: if isPlatformAdmin();
+
+      // Anyone can read a single booking by ID (Guest Review & Payment Pages)
+      allow get: if true;
+
+      // Admin/Staff/Platform Admin read bookings
+      allow read: if isAdminOrStaff() || isPlatformAdmin();
+
+      // Client reads their own bookings
+      allow read: if isAuthenticated() && (
+                    resource.data.clientId == request.auth.uid ||
+                    (resource.data.clientEmail != null && request.auth.token.email != null && resource.data.clientEmail.lower() == request.auth.token.email.lower())
+                  );
+
+      // Talent reads:
+      //  - bookings they are assigned on
+      //  - bookings they applied to
+      //  - any Pending booking in their company (to browse available gigs)
+      allow read: if isAuthenticated() && (
+                    resource.data.talentId == request.auth.uid ||
+                    resource.data.selectedTalentId == request.auth.uid ||
+                    (resource.data.selectedTalentIds != null &&
+                     request.auth.uid in resource.data.selectedTalentIds) ||
+                    (resource.data.applicants != null &&
+                     request.auth.uid in resource.data.applicants) ||
+                    (isTalent() &&
+                     (resource.data.companyId == myEffectiveCompanyId() || sameCompany(myEffectiveCompanyId(), resource.data.companyId)) &&
+                     resource.data.status == 'Pending')
+                  );
+
+      // Anyone can create a booking (public booking form)
+      allow create: if request.resource.data.companyId != null;
+
+      // Anyone can update a booking by ID (Guest client hiring/selecting performers or uploading payment receipt, plus logged-in users)
+      allow update: if true;
+    }
+
+    // ── Notifications Collection ──────────────────────────────────────────────
+    match /notifications/{notificationId} {
+      allow read, update, delete: if isAuthenticated() &&
+                                  request.auth.uid == resource.data.userId;
+
+      // ✅ Any authenticated user can create a notification
+      //    (talent→client, talent→admin, admin→talent all need this)
+      allow create: if isAuthenticated();
+
+      allow read, write, delete: if isPlatformAdmin();
+    }
+
+    // ── Platform Roles Collection ─────────────────────────────────────────────
+    match /platform_roles/{roleId} {
+      allow read, write: if isPlatformAdmin();
+      allow read: if isAuthenticated() &&
+                 getUserRole() in ['platform_manager', 'platform_support', 'platform_viewer'];
+    }
+
+     // ── Pending Profile Updates Collection ────────────────────────────────────
+    match /pending_profile_updates/{updateId} {
+      allow read: if true;
+      allow create, update: if isAuthenticated() && request.auth.uid == updateId;
+      allow read, update, delete: if isAdminOrStaff() || isPlatformAdmin();
+    }
+
+
+    // ── Talent Activity Logs Collection ───────────────────────────────────────
+    match /talent_activity_logs/{logId} {
+      allow read, write, delete: if isAdminOrStaff() || isPlatformAdmin();
+    }
+
+    // ── Platform Settings Collection ──────────────────────────────────────────
+    match /platform_settings/{settingId} {
+      allow read, write: if isPlatformAdmin();
+    }
+
+    // ── Company Stripe Keys Collection ──────────────────────────────────────────
+    match /company_stripe_keys/{companyId} {
+      allow read, write: if isAuthenticated() && isAdminOrStaff() && sameCompany(myCompanyId(), companyId);
+      allow read, write: if isPlatformAdmin();
+    }
+
+    // ── Subscription Plans Collection ─────────────────────────────────────────
+    match /subscriptionPlans/{planId} {
+      allow read: if true;
+      allow write: if isPlatformAdmin();
+    }
+
+    // ── Reviews Collection ────────────────────────────────────────────────────
+    match /reviews/{reviewId} {
+      allow read: if true;
+      allow create: if isAuthenticated() && request.auth.uid == request.resource.data.fromId;
+      allow update, delete: if isAuthenticated() && (request.auth.uid == resource.data.fromId || isPlatformAdmin() || (isAdminOrStaff() && sameCompany(myCompanyId(), resource.data.companyId)));
+    }
+
+    // ── Client Internal Ratings Collection ─────────────────────────────────────
+    match /client_internal_ratings/{ratingId} {
+      allow read, write, delete: if isAdminOrStaff() || isPlatformAdmin();
+    }
+
+    // ── Notes Collection ──────────────────────────────────────────────────────
+    match /notes/{noteId} {
+      allow read, write, delete: if isPlatformAdmin();
+
+      function isAssociatedWithBooking(bookingId, userId) {
+        let path = /databases/$(database)/documents/bookings/$(bookingId);
+        return exists(path) && (
+          get(path).data.clientId == userId ||
+          get(path).data.talentId == userId ||
+          get(path).data.selectedTalentId == userId ||
+          (get(path).data.get('selectedTalentIds', null) != null && userId in get(path).data.get('selectedTalentIds', [])) ||
+          (get(path).data.get('applicants', null) != null && userId in get(path).data.get('applicants', []))
+        );
+      }
+
+      allow read: if isAuthenticated() && (
+        (isAdminOrStaff() && (resource.data.companyId == myCompanyId() || sameCompany(myCompanyId(), resource.data.companyId))) ||
+        (resource.data.authorId == request.auth.uid)
+      );
+
+      allow create: if isAuthenticated() &&
+                    request.resource.data.authorId == request.auth.uid && (
+                      (isAdminOrStaff() &&
+                       sameCompany(myCompanyId(), request.resource.data.companyId) &&
+                       request.resource.data.entityType in ['booking', 'talent', 'client']) ||
+                      (myEffectiveRole() == 'client' && (
+                        (request.resource.data.entityType == 'booking' && isAssociatedWithBooking(request.resource.data.entityId, request.auth.uid)) ||
+                        (request.resource.data.entityType == 'talent' && sameCompany(myEffectiveCompanyId(), request.resource.data.companyId))
+                      )) ||
+                      (isTalent() &&
+                       request.resource.data.entityType == 'booking' &&
+                       isAssociatedWithBooking(request.resource.data.entityId, request.auth.uid))
+                    );
+
+      allow update, delete: if isAuthenticated() && resource.data.authorId == request.auth.uid;
+    }
+
+    // ── Support Tickets Collection ───────────────────────────────────────────
+    match /support_tickets/{ticketId} {
+      allow create: if isAuthenticated() && (isAdminOrStaff() || isPlatformAdmin());
+      allow read: if isAuthenticated() && (
+                    isPlatformAdmin() || 
+                    (isAdminOrStaff() && (resource.data.companyId == myCompanyId() || sameCompany(myCompanyId(), resource.data.companyId)))
+                  );
+      allow update: if isAuthenticated() && (
+                      isPlatformAdmin() || 
+                      (isAdminOrStaff() && (resource.data.companyId == myCompanyId() || sameCompany(myCompanyId(), resource.data.companyId)))
+                    );
+      allow delete: if isPlatformAdmin();
+    }
+
+    // ── Chats Collection ──────────────────────────────────────────────────────
+    match /chats/{bookingId} {
+      function getBooking() {
+        return get(/databases/$(database)/documents/bookings/$(bookingId)).data;
+      }
+      
+      function isChatMember() {
+        let booking = getBooking();
+        return isPlatformAdmin() ||
+               isAdminOrStaff() ||
+               request.auth.uid == booking.clientId ||
+               booking.talentId == request.auth.uid ||
+               booking.selectedTalentId == request.auth.uid ||
+               (booking.get('selectedTalentIds', null) != null && request.auth.uid in booking.selectedTalentIds);
+      }
+
+      allow read, write: if true;
+      allow delete: if isPlatformAdmin();
+
+      match /messages/{messageId} {
+        allow read, create: if true;
+        allow delete: if isPlatformAdmin();
+      }
+    }
+  }
+}
