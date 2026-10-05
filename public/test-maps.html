@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyAXZ3WyjwjpmfzsKdCvdAPcKczFAGTanf4&libraries=places"></script>
+</head>
+<body>
+    <div id="output">Waiting for Google Maps...</div>
+    <script>
+        setTimeout(() => {
+            const out = document.getElementById("output");
+            out.innerHTML = "Script executed.<br>";
+            try {
+                if (!window.google || !window.google.maps || !window.google.maps.places) {
+                    out.innerHTML += "ERROR: google.maps.places is not defined.<br>";
+                    return;
+                }
+                const service = new google.maps.places.AutocompleteService();
+                out.innerHTML += "Service created, fetching predictions for 'los an'...<br>";
+                
+                service.getPlacePredictions({ input: "los", types: ["(cities)"] }, (results, status) => {
+                    out.innerHTML += "<h2>Status: " + status + "</h2>";
+                    out.innerHTML += "<pre id='results_json'>" + JSON.stringify(results, null, 2) + "</pre>";
+                });
+            } catch (err) {
+                out.innerHTML += "<h3>Exception: " + err.message + "</h3>";
+            }
+        }, 2000);
+    </script>
+</body>
+</html>
